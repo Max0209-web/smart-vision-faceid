@@ -57,9 +57,10 @@ database.db      — база данных (создаётся автомати�
 
 ```bash
 pip install -r requirements.txt
+python download_models.py     # подтянет недостающие ONNX-модели (~38 МБ)
 ```
 
-Модели уже лежат в папке `models/`. Если их нет — скачайте из OpenCV Zoo:
+Если интернета нет — скачайте модели вручную из OpenCV Zoo:
 
 - [face_detection_yunet_2023mar.onnx](https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx)
 - [face_recognition_sface_2021dec.onnx](https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx)

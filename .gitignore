@@ -21,3 +21,7 @@ test_overlay.png
 
 # --- Локальные настройки инструментов ---
 .claude/
+
+# --- Большая ONNX-модель распознавания (38 МБ) ---
+# Скачивается скриптом download_models.py
+models/face_recognition_sface_2021dec.onnx
