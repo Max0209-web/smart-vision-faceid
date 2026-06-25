@@ -5,9 +5,12 @@
 процент совпадения, режимы white/black list и журнал.
 """
 import base64
+import binascii
 import json
 import mimetypes
 import os
+import re
+import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -18,6 +21,12 @@ import config
 from service import FaceService, ServiceError
 
 SVC = None  # инициализируется в run()
+
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+MAX_JSON_BYTES = 10 * 1024 * 1024
+ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+ENGINE_LOCK = threading.Lock()
 
 
 # --- Разбор multipart/form-data (для загрузки файлов) -------------------
@@ -90,10 +99,46 @@ def list_samples():
     return samples
 
 
+def _is_image_bytes(data: bytes) -> bool:
+    if not data or len(data) > MAX_UPLOAD_BYTES:
+        return False
+    buf = np.frombuffer(data, dtype=np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR) is not None
+
+
+def _safe_image_ext(filename: str) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext not in ALLOWED_IMAGE_EXTS:
+        raise ServiceError("Разрешены только изображения jpg, jpeg, png, webp, bmp")
+    return ext
+
+
+def _validate_image_bytes(data: bytes, filename: str = "image.jpg") -> str:
+    ext = _safe_image_ext(filename)
+    if not _is_image_bytes(data):
+        raise ServiceError("Файл не похож на изображение или слишком большой")
+    return ext
+
+
+def clean_name(value: str) -> str:
+    name = CONTROL_CHARS.sub("", value or "").strip()
+    if not name:
+        raise ServiceError("Не указано имя")
+    if len(name) > 80:
+        raise ServiceError("Имя слишком длинное")
+    return name
+
+
 def decode_b64_image(data_url: str) -> np.ndarray:
     """base64 data-URL из браузера -> изображение OpenCV."""
     raw = data_url.split(",", 1)[-1]
-    buf = np.frombuffer(base64.b64decode(raw), dtype=np.uint8)
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        raise ServiceError("Некорректные данные изображения")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ServiceError("Изображение слишком большое")
+    buf = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     if img is None:
         raise ServiceError("Не удалось декодировать кадр")
@@ -104,18 +149,30 @@ def save_b64_image(data_url: str) -> str:
     """Сохраняет кадр из браузера в файл, возвращает путь."""
     os.makedirs(config.UPLOAD_DIR, exist_ok=True)
     raw = data_url.split(",", 1)[-1]
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        raise ServiceError("Некорректные данные изображения")
+    _validate_image_bytes(data, "frame.jpg")
     path = os.path.join(config.UPLOAD_DIR, f"{uuid.uuid4().hex}.jpg")
     with open(path, "wb") as f:
-        f.write(base64.b64decode(raw))
+        f.write(data)
     return path
 
 
 def safe_path(path: str) -> str:
     """Разрешает отдавать только файлы из dataset и uploads."""
     real = os.path.realpath(path)
-    allowed = [os.path.realpath(config.DATASET_DIR),
-               os.path.realpath(config.UPLOAD_DIR)]
-    if any(real.startswith(a) for a in allowed) and os.path.isfile(real):
+    allowed = [
+        os.path.realpath(config.DATASET_DIR),
+        os.path.realpath(config.UPLOAD_DIR),
+    ]
+    try:
+        inside = any(os.path.commonpath([real, root]) == root for root in allowed)
+    except ValueError:
+        inside = False
+    if inside and os.path.isfile(real):
+        _safe_image_ext(real)
         return real
     raise ServiceError("Доступ к файлу запрещён")
 
@@ -130,6 +187,8 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -138,12 +197,20 @@ class Handler(BaseHTTPRequestHandler):
         data = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; "
+                         "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                         "connect-src 'self'; object-src 'none'; base-uri 'self'")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", 0))
+        if length > MAX_JSON_BYTES:
+            raise ServiceError("Запрос слишком большой")
         return self.rfile.read(length) if length else b""
 
     def get_payload(self) -> dict:
@@ -151,6 +218,8 @@ class Handler(BaseHTTPRequestHandler):
         ctype = self.headers.get("Content-Type", "")
         body = self.read_body()
         if ctype.startswith("multipart/form-data"):
+            if "boundary=" not in ctype:
+                raise ServiceError("Некорректная multipart-форма")
             boundary = ctype.split("boundary=")[-1].encode()
             return parse_multipart(body, boundary)
         if body:
@@ -162,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
         if "image" in payload and isinstance(payload["image"], dict):
             os.makedirs(config.UPLOAD_DIR, exist_ok=True)
             up = payload["image"]
-            ext = os.path.splitext(up["filename"])[1] or ".jpg"
+            ext = _validate_image_bytes(up["data"], up["filename"])
             fname = f"{uuid.uuid4().hex}{ext}"
             path = os.path.join(config.UPLOAD_DIR, fname)
             with open(path, "wb") as f:
@@ -171,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
         if payload.get("image_b64"):
             return save_b64_image(payload["image_b64"])
         if payload.get("sample_path"):
-            return payload["sample_path"]
+            return safe_path(payload["sample_path"])
         raise ServiceError("Изображение не передано")
 
     # --- GET -----------------------------------------------------------
@@ -197,10 +266,14 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(qs.get("path", [""])[0])
         real = safe_path(path)
         ctype = mimetypes.guess_type(real)[0] or "application/octet-stream"
+        if not ctype.startswith("image/"):
+            raise ServiceError("Можно отдавать только изображения")
         with open(real, "rb") as f:
             data = f.read()
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -223,40 +296,48 @@ class Handler(BaseHTTPRequestHandler):
 
             if route == "/api/recognize":
                 # Покадровое распознавание для живой камеры (без журнала)
-                img = decode_b64_image(payload["image_b64"])
-                mode = payload.get("mode") or SVC.get_mode()
-                faces = []
-                for face in SVC.engine.detect_faces(img):
-                    try:
-                        emb = SVC.engine.embedding_from_face(img, face)
-                    except cv2.error:
-                        continue
-                    res = SVC.evaluate(emb, mode)
-                    x, y, w, h = [int(v) for v in face[:4]]
-                    faces.append({
-                        "box": [x, y, w, h],
-                        "name": res["matched_name"],
-                        "score": res["score"],
-                        "decision": res["decision"],
-                        "list_type": res["matched_list_type"],
-                        "reason": res["reason"],
-                    })
-                self.send_json({"faces": faces,
-                                "w": img.shape[1], "h": img.shape[0]})
+                if not payload.get("image_b64"):
+                    raise ServiceError("Кадр не передан")
+                if not ENGINE_LOCK.acquire(blocking=False):
+                    self.send_json({"busy": True, "faces": []})
+                    return
+                try:
+                    img = decode_b64_image(payload["image_b64"])
+                    mode = payload.get("mode") or SVC.get_mode()
+                    faces = []
+                    for face in SVC.engine.detect_faces(img):
+                        try:
+                            emb = SVC.engine.embedding_from_face(img, face)
+                        except cv2.error:
+                            continue
+                        res = SVC.evaluate(emb, mode)
+                        x, y, w, h = [int(v) for v in face[:4]]
+                        faces.append({
+                            "box": [x, y, w, h],
+                            "name": res["matched_name"],
+                            "score": res["score"],
+                            "decision": res["decision"],
+                            "list_type": res["matched_list_type"],
+                            "reason": res["reason"],
+                        })
+                    self.send_json({"faces": faces,
+                                    "w": img.shape[1], "h": img.shape[0]})
+                finally:
+                    ENGINE_LOCK.release()
 
             elif route == "/api/check":
                 image = self.resolve_image(payload)
                 mode = payload.get("mode") or SVC.get_mode()
-                result = SVC.check(image, mode)
+                with ENGINE_LOCK:
+                    result = SVC.check(image, mode)
                 self.send_json({"result": result, "state": self.state()})
 
             elif route == "/api/enroll":
                 image = self.resolve_image(payload)
-                name = (payload.get("name") or "").strip()
+                name = clean_name(payload.get("name") or "")
                 group = payload.get("group") or config.GROUP_OWN
-                if not name:
-                    raise ServiceError("Не указано имя")
-                info = SVC.enroll(name, image, group)
+                with ENGINE_LOCK:
+                    info = SVC.enroll(name, image, group)
                 self.send_json({"info": info, "state": self.state()})
 
             elif route == "/api/remove":
@@ -285,17 +366,40 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, 400)
 
 
+class SmartVisionHTTPServer(ThreadingHTTPServer):
+    request_queue_size = 64
+    daemon_threads = True
+    allow_reuse_address = True
+    ssl_context = None
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        if self.ssl_context is None:
+            return sock, addr
+        try:
+            sock.settimeout(4)
+            tls_sock = self.ssl_context.wrap_socket(
+                sock, server_side=True, do_handshake_on_connect=False
+            )
+            tls_sock.do_handshake()
+            tls_sock.settimeout(20)
+            return tls_sock, addr
+        except OSError:
+            sock.close()
+            raise
+
+
 def run(host="127.0.0.1", port=8000, certfile=None, keyfile=None):
     global SVC
     print("Инициализация сервиса (загрузка моделей)...")
     SVC = FaceService()
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = SmartVisionHTTPServer((host, port), Handler)
     scheme = "http"
     if certfile and keyfile:
         import ssl
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile, keyfile)
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        server.ssl_context = ctx
         scheme = "https"
     print("=" * 60)
     print(f"  Веб-интерфейс запущен:  {scheme}://{host}:{port}")
@@ -318,20 +422,20 @@ PAGE = r"""<!DOCTYPE html>
 <title>SMART VISION — свой / чужой</title>
 <style>
   :root{
-    --bg:#1b212e; --surface:#232b3c; --surface2:#2c3650; --line:#333d54;
-    --txt:#e7ecf4; --muted:#8993a8; --accent:#5b8cff;
+    --bg:#111827; --surface:#182232; --surface2:#202c3d; --line:#2d394b;
+    --txt:#edf2f7; --muted:#9aa6b5; --accent:#3b82f6;
     --ok:#4ecb88; --no:#fa5f6b;
   }
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:var(--bg);color:var(--txt);
        font-family:'Segoe UI',Roboto,system-ui,sans-serif;font-size:14px;
-       line-height:1.5;padding:28px max(28px,4vw);max-width:1240px;margin:0 auto}
+       line-height:1.5;padding:24px max(22px,4vw);max-width:1280px;margin:0 auto}
 
   /* --- Шапка --- */
   header{display:flex;justify-content:space-between;align-items:center;
-         gap:20px;flex-wrap:wrap;margin-bottom:24px}
+         gap:20px;flex-wrap:wrap;margin-bottom:18px}
   .brand{display:flex;align-items:center;gap:13px}
-  .logo{width:42px;height:42px;border-radius:11px;background:var(--accent);
+  .logo{width:40px;height:40px;border-radius:8px;background:var(--accent);
         display:flex;align-items:center;justify-content:center;
         font-weight:800;font-size:16px;color:#fff;letter-spacing:.5px}
   .title{font-size:18px;font-weight:700;letter-spacing:.2px}
@@ -339,7 +443,8 @@ PAGE = r"""<!DOCTYPE html>
   .controls{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
 
   /* сегментированный переключатель режима */
-  .seg{display:flex;background:var(--surface);border-radius:10px;padding:4px;
+  .seg{display:flex;background:var(--surface);border:1px solid var(--line);
+       border-radius:8px;padding:4px;
        gap:4px}
   .seg button{border:0;background:transparent;color:var(--muted);
        padding:7px 14px;border-radius:7px;font-weight:600;font-size:13px;
@@ -351,12 +456,21 @@ PAGE = r"""<!DOCTYPE html>
   .thr input[type=range]{width:120px;accent-color:var(--accent);cursor:pointer}
   .thrval{color:var(--txt);font-weight:600;min-width:38px}
 
-  .modehint{background:var(--surface);border-left:3px solid var(--accent);
-       border-radius:8px;padding:9px 14px;font-size:12.5px;color:var(--muted);
-       margin-bottom:22px}
+  .modehint{background:var(--surface);border:1px solid var(--line);
+       border-left:3px solid var(--accent);border-radius:8px;padding:9px 14px;
+       font-size:12.5px;color:var(--muted);margin-bottom:14px}
+
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px}
+  .stat{background:var(--surface);border:1px solid var(--line);border-radius:8px;
+        padding:12px 14px}
+  .stat span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;
+             letter-spacing:.5px}
+  .stat b{display:block;margin-top:3px;font-size:20px;line-height:1.15}
+  @media(max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}}
 
   /* --- Карточки --- */
-  .card{background:var(--surface);border-radius:16px;padding:20px;margin-bottom:20px}
+  .card{background:var(--surface);border:1px solid var(--line);
+        border-radius:8px;padding:18px;margin-bottom:18px}
   .card-h{font-size:13px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
           color:var(--muted);margin-bottom:14px}
   .card-h b{color:var(--txt)}
@@ -364,7 +478,7 @@ PAGE = r"""<!DOCTYPE html>
   /* --- Камера --- */
   .camera{display:grid;grid-template-columns:1.4fr 1fr;gap:20px}
   @media(max-width:780px){.camera{grid-template-columns:1fr}}
-  .camwrap{position:relative;background:#11151e;border-radius:14px;
+  .camwrap{position:relative;background:#0b111c;border-radius:8px;
            overflow:hidden;aspect-ratio:4/3}
   .camwrap video{display:block;width:100%;height:100%;object-fit:cover}
   .camwrap canvas{position:absolute;inset:0;width:100%;height:100%}
@@ -376,13 +490,11 @@ PAGE = r"""<!DOCTYPE html>
   .campanel{display:flex;flex-direction:column;gap:14px}
 
   /* --- Блок вердикта --- */
-  .verdict{flex:1;border-radius:14px;padding:18px;background:var(--surface2);
+  .verdict{flex:1;border-radius:8px;padding:18px;background:var(--surface2);
            border-left:4px solid var(--line);display:flex;flex-direction:column;
            justify-content:center;min-height:150px;transition:.2s}
-  .verdict.allowed{border-left-color:var(--ok);
-                   background:linear-gradient(120deg,rgba(78,203,136,.12),var(--surface2))}
-  .verdict.denied{border-left-color:var(--no);
-                  background:linear-gradient(120deg,rgba(250,95,107,.12),var(--surface2))}
+  .verdict.allowed{border-left-color:var(--ok);background:var(--surface2)}
+  .verdict.denied{border-left-color:var(--no);background:var(--surface2)}
   .v-title{font-size:21px;font-weight:800;letter-spacing:.3px}
   .verdict.allowed .v-title{color:var(--ok)}
   .verdict.denied .v-title{color:var(--no)}
@@ -394,7 +506,7 @@ PAGE = r"""<!DOCTYPE html>
   .v-meta{font-size:12px;color:var(--muted)}
 
   /* --- Кнопки --- */
-  button{font:inherit;border:0;border-radius:9px;background:var(--accent);
+  button{font:inherit;border:0;border-radius:7px;background:var(--accent);
          color:#fff;font-weight:600;padding:10px 16px;cursor:pointer;transition:.15s}
   button:hover:not(:disabled){filter:brightness(1.12)}
   button:disabled{opacity:.4;cursor:default}
@@ -402,21 +514,21 @@ PAGE = r"""<!DOCTYPE html>
   button.sm{padding:6px 10px;font-size:12px;border-radius:7px}
   .row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
 
-  input[type=text],input:not([type]),select{font:inherit;border-radius:9px;
+  input[type=text],input:not([type]),select{font:inherit;border-radius:7px;
         border:1px solid var(--line);background:var(--bg);color:var(--txt);
         padding:9px 11px}
   select{cursor:pointer}
-  .filebtn{background:var(--surface2);color:var(--txt);border-radius:9px;
+  .filebtn{background:var(--surface2);color:var(--txt);border-radius:7px;
            padding:9px 14px;cursor:pointer;font-weight:600;font-size:13px}
   .filebtn input{display:none}
 
   /* --- Галерея образцов --- */
   .samples{display:grid;grid-template-columns:repeat(auto-fill,minmax(78px,1fr));
            gap:9px;margin-bottom:14px}
-  .samp{border:2px solid transparent;border-radius:11px;cursor:pointer;
+  .samp{border:1px solid var(--line);border-radius:8px;cursor:pointer;
         background:var(--bg);padding:4px;transition:.15s}
-  .samp:hover{border-color:var(--line)}
-  .samp img{width:100%;height:66px;object-fit:cover;border-radius:7px;display:block}
+  .samp:hover{border-color:var(--accent)}
+  .samp img{width:100%;height:66px;object-fit:cover;border-radius:5px;display:block}
   .samp div{font-size:10px;color:var(--muted);margin-top:4px;text-align:center;
             overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
@@ -442,7 +554,7 @@ PAGE = r"""<!DOCTYPE html>
 
   /* --- Уведомление --- */
   #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);
-         background:var(--accent);color:#fff;padding:11px 20px;border-radius:10px;
+         background:var(--accent);color:#fff;padding:11px 20px;border-radius:8px;
          font-weight:600;font-size:13px;opacity:0;pointer-events:none;transition:.25s}
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 
@@ -450,10 +562,10 @@ PAGE = r"""<!DOCTYPE html>
   .modal{position:fixed;inset:0;background:rgba(10,13,20,.74);z-index:50;
          display:none;align-items:center;justify-content:center}
   .modal.show{display:flex}
-  .modal-box{background:var(--surface);border-radius:16px;padding:22px;
+  .modal-box{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:22px;
              width:340px;max-width:92vw;display:flex;flex-direction:column;gap:12px}
   .modal-h{font-size:16px;font-weight:700}
-  .modal-prev{width:104px;height:104px;object-fit:cover;border-radius:12px;
+  .modal-prev{width:104px;height:104px;object-fit:cover;border-radius:8px;
               align-self:center;background:var(--bg);border:1px solid var(--line)}
   .modal-box input,.modal-box select{width:100%}
   .modal-act{display:flex;gap:9px}
@@ -486,6 +598,13 @@ PAGE = r"""<!DOCTYPE html>
 </header>
 
 <div class="modehint" id="modeHint"></div>
+
+<div class="stats">
+  <div class="stat"><span>Лица в базе</span><b id="statPersons">0</b></div>
+  <div class="stat"><span>Проверки</span><b id="statChecks">0</b></div>
+  <div class="stat"><span>Разрешено</span><b id="statAllowed">0</b></div>
+  <div class="stat"><span>Отказано</span><b id="statDenied">0</b></div>
+</div>
 
 <!-- КАМЕРА -->
 <div class="card">
@@ -590,6 +709,12 @@ async function api(url,opt){
   return j;
 }
 function tagClass(lt){return lt==='white'?'white':lt==='black'?'black':'neutral';}
+function esc(v){
+  return String(v ?? '').replace(/[&<>"']/g,ch=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[ch]));
+}
+function escAttr(v){ return esc(v).replace(/`/g,'&#96;'); }
 
 function toast(msg){
   const t=$('toast'); t.textContent=msg; t.classList.add('show');
@@ -635,19 +760,24 @@ function render(s){
   applyMode(s.mode);
   $('thr').value=Math.round(s.threshold*100); thrInput();
   GROUPS=s.groups;
-  $('enrollGroup').innerHTML=GROUPS.map(g=>`<option>${g}</option>`).join('');
+  $('enrollGroup').innerHTML=GROUPS.map(g=>
+    `<option value="${escAttr(g)}">${esc(g)}</option>`).join('');
 
   PERSONS=s.persons;
   renderPersons();
+  $('statPersons').textContent=PERSONS.filter(p=>p.status==='active').length;
+  $('statChecks').textContent=s.checks.length;
+  $('statAllowed').textContent=s.checks.filter(c=>c.decision==='ALLOWED').length;
+  $('statDenied').textContent=s.checks.filter(c=>c.decision!=='ALLOWED').length;
 
   $('logBody').innerHTML=s.checks.map(c=>{
     const ok=c.decision==='ALLOWED';
     return `<tr>
-      <td class="muted">${c.time.slice(11)}</td>
-      <td>${c.name||'неизвестный'}</td>
-      <td>${c.score}%</td>
+      <td class="muted">${esc((c.time||'').slice(11))}</td>
+      <td>${esc(c.name||'неизвестный')}</td>
+      <td>${esc(c.score)}%</td>
       <td><span class="tag ${ok?'white':'black'}">${ok?'РАЗРЕШЁН':'ЗАПРЕЩЁН'}</span></td>
-      <td class="muted" style="font-size:12px">${c.reason}</td></tr>`;
+      <td class="muted" style="font-size:12px">${esc(c.reason)}</td></tr>`;
   }).join('')||'<tr><td colspan=5 class="muted">Журнал пуст</td></tr>';
 }
 
@@ -656,11 +786,11 @@ function renderPersons(){
   const list=q ? PERSONS.filter(p=>p.name.toLowerCase().includes(q)) : PERSONS;
   $('personsBody').innerHTML=list.map(p=>{
     const opts=GROUPS.map(g=>
-      `<option ${g===p.group?'selected':''}>${g}</option>`).join('');
+      `<option value="${escAttr(g)}" ${g===p.group?'selected':''}>${esc(g)}</option>`).join('');
     const removed=p.status==='removed';
     return `<tr class="${removed?'removed':''}">
-      <td>${p.name}</td>
-      <td><span class="tag ${tagClass(p.list_type)}">${p.group}</span></td>
+      <td>${esc(p.name)}</td>
+      <td><span class="tag ${tagClass(p.list_type)}">${esc(p.group)}</span></td>
       <td><div class="row" style="justify-content:flex-end">
         <select class="sm" onchange="moveP(${p.id},this.value)">${opts}</select>
         <button class="sm ghost" onclick="toggleP(${p.id},'${p.status}')">
@@ -696,8 +826,8 @@ async function loadSamples(){
   SAMPLES=(await api('/api/samples')).samples;
   $('samples').innerHTML=SAMPLES.map((s,i)=>
     `<div class="samp" onclick="runCheckSample(${i})">
-       <img src="/img?path=${encodeURIComponent(s.path)}">
-       <div>${s.name}</div></div>`).join('');
+       <img src="/img?path=${encodeURIComponent(s.path)}" alt="${escAttr(s.name)}">
+       <div>${esc(s.name)}</div></div>`).join('');
 }
 async function runCheckSample(i){
   $('checkErr').textContent='';
@@ -763,9 +893,16 @@ async function toggleP(id,status){
 }
 
 // --- Живая камера ---------------------------------------------------
-let camStream=null, camTimer=null, camBusy=false;
+let camStream=null, camTimer=null, camBusy=false, camRaf=null;
+let smoothFaces=[];
 const _proc=document.createElement('canvas');
-const PROC_W=480;
+const PROC_W=320;
+const CAM_MIN_DELAY=650;
+const CAM_TIMEOUT=2500;
+const BOX_TWEEN=420;
+const BOX_HOLD=1800;
+const BOX_FADE=450;
+const BOX_TTL=BOX_HOLD+BOX_FADE;
 
 async function toggleCam(){
   if(camStream){ stopCam(); return; }
@@ -779,11 +916,13 @@ async function toggleCam(){
     $('camBtn').textContent='Выключить камеру';
     $('camSnap').disabled=false;
     idleVerdict('наведите лицо в кадр');
-    camTimer=setInterval(camTick,300);
+    startCamLoops();
   }catch(e){ $('camErr').textContent='Нет доступа к камере: '+e.message; }
 }
 function stopCam(){
-  clearInterval(camTimer); camTimer=null;
+  clearTimeout(camTimer); camTimer=null;
+  if(camRaf) cancelAnimationFrame(camRaf);
+  camRaf=null; smoothFaces=[];
   if(camStream){ camStream.getTracks().forEach(t=>t.stop()); camStream=null; }
   $('cam').srcObject=null; lastRecog=null;
   const o=$('overlay'); o.getContext('2d').clearRect(0,0,o.width,o.height);
@@ -793,48 +932,145 @@ function stopCam(){
   $('camSnap').disabled=true;
   idleVerdict('включите камеру или выберите фото ниже');
 }
+function startCamLoops(){
+  smoothFaces=[];
+  scheduleCamTick(0);
+  if(camRaf) cancelAnimationFrame(camRaf);
+  camRaf=requestAnimationFrame(animateOverlay);
+}
+function scheduleCamTick(delay=CAM_MIN_DELAY){
+  clearTimeout(camTimer);
+  if(camStream) camTimer=setTimeout(camTick,delay);
+}
 function grabFrame(width){
   const v=$('cam'), vw=v.videoWidth, vh=v.videoHeight;
   if(!vw) return null;
   const h=Math.round(width*vh/vw);
   _proc.width=width; _proc.height=h;
   _proc.getContext('2d').drawImage(v,0,0,width,h);
-  return _proc.toDataURL('image/jpeg',0.7);
+  return _proc.toDataURL('image/jpeg',0.5);
 }
 async function camTick(){
-  if(camBusy||!camStream) return;
+  if(camBusy||!camStream){ scheduleCamTick(); return; }
   const data=grabFrame(PROC_W);
-  if(!data) return;
+  if(!data){ scheduleCamTick(); return; }
   camBusy=true;
+  const ctrl=new AbortController();
+  const tm=setTimeout(()=>ctrl.abort(),CAM_TIMEOUT);
   try{
     const j=await api('/api/recognize',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({image_b64:data,mode:currentMode})});
-    drawFaces(j);
-  }catch(e){}finally{ camBusy=false; }
+      body:JSON.stringify({image_b64:data,mode:currentMode}),
+      signal:ctrl.signal});
+    if(!j.busy) drawFaces(j);
+  }catch(e){}finally{ clearTimeout(tm); camBusy=false; scheduleCamTick(); }
 }
 function drawFaces(j){
   lastRecog=j;
-  const o=$('overlay'); o.width=j.w; o.height=j.h;
-  const ctx=o.getContext('2d'); ctx.clearRect(0,0,j.w,j.h);
-  const fs=Math.round(j.w/20);
-  ctx.font='bold '+fs+'px Segoe UI';
-  for(const f of j.faces){
-    const ok=f.decision==='ALLOWED', col=ok?'#4ecb88':'#fa5f6b';
-    const [x,y,w,h]=f.box;
-    ctx.lineWidth=Math.max(2,j.w/200); ctx.strokeStyle=col;
-    ctx.strokeRect(x,y,w,h);
-    drawLabel(ctx,f.name?`${f.name} · ${f.score}%`:'Неизвестный',x,y-7,col);
-    drawLabel(ctx,ok?'Доступ разрешён':'Доступ запрещён',x,y+h+fs,col);
-  }
-  // вердикт по самому крупному лицу
+  ensureOverlaySize(j.w,j.h);
+  updateSmoothFaces(j);
   if(j.faces.length){
     let big=j.faces[0];
     for(const f of j.faces) if(f.box[2]*f.box[3]>big.box[2]*big.box[3]) big=f;
     showVerdict(big);
-  }else if(camStream){
+  }else if(camStream&&!smoothFaces.length){
     idleVerdict('лицо не обнаружено');
   }
+}
+function ensureOverlaySize(w,h){
+  const o=$('overlay');
+  if(o.width!==w||o.height!==h){
+    o.width=w; o.height=h;
+  }
+}
+function updateSmoothFaces(j){
+  const now=performance.now();
+  const used=new Set();
+  for(const f of j.faces){
+    let best=null, bestScore=0;
+    if(j.faces.length===1&&smoothFaces.length===1&&!used.has(smoothFaces[0])){
+      best=smoothFaces[0]; bestScore=1;
+    }else{
+      for(const s of smoothFaces){
+        if(used.has(s)) continue;
+        const sameName=f.name&&s.name===f.name ? 1 : 0;
+        const score=sameName+iou(s.targetBox||s.box,f.box);
+        if(score>bestScore){ bestScore=score; best=s; }
+      }
+    }
+    if(best&&bestScore>0.12){
+      best.fromBox=best.box.slice();
+      best.targetBox=f.box.slice();
+      best.tweenStart=now;
+      best.tweenMs=tweenMs(best.fromBox,best.targetBox);
+      best.name=f.name;
+      best.score=f.score;
+      best.decision=f.decision;
+      best.list_type=f.list_type;
+      best.reason=f.reason;
+      best.lastSeen=now;
+      used.add(best);
+    }else{
+      smoothFaces.push({
+        ...f,
+        box:f.box.slice(),
+        fromBox:f.box.slice(),
+        targetBox:f.box.slice(),
+        tweenStart:now,
+        tweenMs:220,
+        lastSeen:now,
+      });
+    }
+  }
+  smoothFaces=smoothFaces.filter(f=>now-f.lastSeen<BOX_TTL);
+}
+function tweenMs(a,b){
+  const dx=(b[0]+b[2]/2)-(a[0]+a[2]/2);
+  const dy=(b[1]+b[3]/2)-(a[1]+a[3]/2);
+  const d=Math.hypot(dx,dy);
+  return Math.min(620,Math.max(320,d*3.2));
+}
+function easeInOut(t){
+  return t<.5 ? 4*t*t*t : 1-Math.pow(-2*t+2,3)/2;
+}
+function lerpBox(a,b,t){
+  return a.map((v,i)=>v+(b[i]-v)*t);
+}
+function iou(a,b){
+  const ax2=a[0]+a[2], ay2=a[1]+a[3], bx2=b[0]+b[2], by2=b[1]+b[3];
+  const x1=Math.max(a[0],b[0]), y1=Math.max(a[1],b[1]);
+  const x2=Math.min(ax2,bx2), y2=Math.min(ay2,by2);
+  const inter=Math.max(0,x2-x1)*Math.max(0,y2-y1);
+  return inter/(a[2]*a[3]+b[2]*b[3]-inter||1);
+}
+function animateOverlay(){
+  renderOverlay();
+  if(camStream) camRaf=requestAnimationFrame(animateOverlay);
+}
+function renderOverlay(){
+  const o=$('overlay');
+  if(!o.width||!o.height||!lastRecog) return;
+  const ctx=o.getContext('2d'); ctx.clearRect(0,0,o.width,o.height);
+  const fs=Math.round(o.width/20);
+  ctx.font='bold '+fs+'px Segoe UI';
+  const now=performance.now();
+  smoothFaces=smoothFaces.filter(f=>now-f.lastSeen<BOX_TTL);
+  for(const f of smoothFaces){
+    if(f.targetBox&&f.fromBox){
+      const t=Math.min(1,(now-f.tweenStart)/(f.tweenMs||BOX_TWEEN));
+      f.box=lerpBox(f.fromBox,f.targetBox,easeInOut(t));
+      if(t>=1) f.fromBox=f.box.slice();
+    }
+    const ok=f.decision==='ALLOWED', col=ok?'#4ecb88':'#fa5f6b';
+    const age=now-f.lastSeen;
+    ctx.globalAlpha=age<BOX_HOLD ? 1 : Math.max(0,1-(age-BOX_HOLD)/BOX_FADE);
+    const [x,y,w,h]=f.box;
+    ctx.lineWidth=Math.max(2,o.width/200); ctx.strokeStyle=col;
+    ctx.strokeRect(x,y,w,h);
+    drawLabel(ctx,f.name?`${f.name} · ${f.score}%`:'Неизвестный',x,y-7,col);
+    drawLabel(ctx,ok?'Доступ разрешён':'Доступ запрещён',x,y+h+fs,col);
+  }
+  ctx.globalAlpha=1;
 }
 function drawLabel(ctx,text,x,y,col){
   ctx.lineWidth=4; ctx.strokeStyle='rgba(8,10,16,.85)';
@@ -854,6 +1090,9 @@ async function camSnapshot(){
   }catch(e){ $('camErr').textContent=e.message; }
 }
 window.addEventListener('beforeunload',()=>{ if(camStream) stopCam(); });
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden&&camStream) stopCam();
+});
 
 // --- Добавление лица кликом по кадру --------------------------------
 function overlayClick(e){
@@ -861,7 +1100,7 @@ function overlayClick(e){
   const o=$('overlay'), r=o.getBoundingClientRect();
   const cx=(e.clientX-r.left)*(o.width/r.width);
   const cy=(e.clientY-r.top)*(o.height/r.height);
-  for(const f of lastRecog.faces){
+  for(const f of smoothFaces.length?smoothFaces:lastRecog.faces){
     const [x,y,w,h]=f.box;
     if(cx>=x&&cx<=x+w&&cy>=y&&cy<=y+h){ openModal(f); return; }
   }
@@ -884,7 +1123,7 @@ function openModal(f){
   $('mPreview').src=pendingCrop;
   $('mName').value=f.name||'';
   $('mGroup').innerHTML=GROUPS.map(g=>
-    `<option ${g==='Свой'?'selected':''}>${g}</option>`).join('');
+    `<option value="${escAttr(g)}" ${g===GROUPS[0]?'selected':''}>${esc(g)}</option>`).join('');
   $('mErr').textContent='';
   $('modal').classList.add('show');
   setTimeout(()=>$('mName').focus(),50);
